@@ -1,0 +1,364 @@
+local SpatialConvolution_conditioning, parent =
+    torch.class('cudnn.SpatialConvolution_conditioning', 'nn.SpatialConvolution')
+local ffi = require 'ffi'
+local find = require 'cudnn.find'
+local errcheck = cudnn.errcheck
+local checkedCall = find.checkedCall
+
+function SpatialConvolution_conditioning:__init(nInputPlane, nOutputPlane,interval,
+                            kW, kH, dW, dH, padW, padH, groups)
+    local delayedReset = self.reset
+    self.reset = function() end
+    parent.__init(self, nInputPlane, nOutputPlane, kW, kH, dW, dH)
+    self.reset = delayedReset
+    self.padW = padW or 0
+    self.padH = padH or 0
+    self.groups = groups or 1
+    assert(nInputPlane % self.groups == 0,
+           'nInputPlane should be divisible by nGroups')
+    assert(nOutputPlane % self.groups == 0,
+           'nOutputPlane should be divisible by nGroups')
+    self.weight = torch.Tensor(nOutputPlane, nInputPlane/self.groups, kH, kW)
+    self.gradWeight = torch.Tensor(nOutputPlane, nInputPlane/self.groups, kH, kW)
+    self:reset()
+    -- should nil for serialization, the reset will still work
+    self.reset = nil
+
+    self.correlate=torch.Tensor(nOutputPlane,nOutputPlane)
+    self.conditionNumber_input={}
+    self.conditionNumber_gradOutput={}
+
+    self.maxEig_input={}
+    self.maxEig_gradOutput={}
+    
+    
+    self.debug=true
+    self.count=0
+    self.interval=interval or 10
+    self.eig_input={}
+    self.eig_gradOutput={}
+    self.epcilo=10^-35
+end
+
+-- if you change the configuration of the module manually, call this
+function SpatialConvolution_conditioning:resetWeightDescriptors(desc)
+    assert(cudnn.typemap[torch.typename(self.weight)], 'Only Cuda supported duh!')
+    assert(cudnn.typemap[torch.typename(self.bias)] or not self.bias, 'Only Cuda supported duh!')
+
+    -- create descriptor for bias
+    if self.bias then
+        self.biasDesc = cudnn.toDescriptor(self.bias:view(1, self.nOutputPlane,1,1))
+    end
+
+    self.weightDesc = cudnn.setFilterDescriptor(
+       { dataType = cudnn.typemap[torch.typename(self.weight)],
+         filterDimA = desc or
+            {self.nOutputPlane,
+             self.nInputPlane/self.groups,
+             self.kH, self.kW}
+       }
+    )
+
+
+
+
+    return self
+end
+
+function SpatialConvolution_conditioning:fastest(mode)
+    if mode == nil then mode = true end
+    if not self.fastest_mode or self.fastest_mode ~= mode then
+       self.fastest_mode = mode
+       self.iDesc = nil
+    end
+    return self
+end
+
+function SpatialConvolution_conditioning:setMode(fmode, bdmode, bwmode)
+    if fmode ~= nil then
+        self.fmode = fmode
+    end
+    if bdmode ~= nil then
+        self.bdmode = bdmode
+    end
+    if bwmode ~= nil then
+        self.bwmode = bwmode
+    end
+    self.iDesc = nil
+    return self
+end
+
+function SpatialConvolution_conditioning:resetMode()
+    self.fmode = nil
+    self.bdmode = nil
+    self.bwmode = nil
+    return self
+end
+
+function SpatialConvolution_conditioning:noBias()
+   self.bias = nil
+   self.gradBias = nil
+   return self
+end
+
+
+function SpatialConvolution_conditioning:checkInputChanged(input)
+    assert(input:isContiguous(),
+           "input to " .. torch.type(self) .. " needs to be contiguous, but is non-contiguous")
+    if not self.iSize or self.iSize:size() ~= input:dim() then
+       self.iSize = torch.LongStorage(input:dim()):fill(0)
+    end
+    if not self.weightDesc then self:resetWeightDescriptors() end
+    if not self.weightDesc then error "Weights not assigned!" end
+
+    if not self.iDesc or not self.oDesc or input:size(1) ~= self.iSize[1] or input:size(2) ~= self.iSize[2]
+    or input:size(3) ~= self.iSize[3] or input:size(4) ~= self.iSize[4] or (input:dim()==5 and input:size(5) ~= self.iSize[5]) then
+       self.iSize = input:size()
+       assert(self.nInputPlane == input:size(2),
+              'input has to contain: '
+                 .. self.nInputPlane
+                 .. ' feature maps, but received input of size: '
+                 .. input:size(1) .. ' x ' .. input:size(2) .. ' x ' .. input:size(3)
+                 .. (input:dim()>3 and ' x ' .. input:size(4) ..
+                        (input:dim()==5 and ' x ' .. input:size(5) or '') or ''))
+       return true
+    end
+    return false
+end
+
+function SpatialConvolution_conditioning:createIODescriptors(input)
+   local batch = true
+   if input:dim() == 3 then
+      input = input:view(1, input:size(1), input:size(2), input:size(3))
+      batch = false
+   end
+   if SpatialConvolution_conditioning.checkInputChanged(self, input) then
+        -- create input descriptor
+        local input_slice = input:narrow(2,1,self.nInputPlane)
+        self.iDesc = cudnn.toDescriptor(input_slice)
+        -- create conv descriptor
+        self.padH, self.padW = self.padH or 0, self.padW or 0
+        -- those needed to calculate hash
+        self.pad = {self.padH, self.padW}
+        self.stride = {self.dH, self.dW}
+	
+        self.convDescData = { padA = self.pad,
+             filterStrideA = self.stride,
+             dilationA = {1,1},
+             dataType = cudnn.configmap(torch.type(self.weight)),
+	     mathType = 'CUDNN_DEFAULT_MATH',
+             groupCount = self.groups
+        }
+
+        self.convDesc = cudnn.setConvolutionDescriptor(self.convDescData)
+
+        -- get output shape, resize output
+        local oSize = torch.IntTensor(4)
+        errcheck('cudnnGetConvolutionNdForwardOutputDim',
+                 self.convDesc[0], self.iDesc[0],
+                 self.weightDesc[0], 4, oSize:data())
+
+        self.output:resize(oSize:long():storage())
+        self.oSize = self.output:size()
+        local output_slice = self.output:narrow(2,1,self.nOutputPlane)
+        -- create descriptor for output
+        self.oDesc = cudnn.toDescriptor(output_slice)
+        self.oDescForBias = cudnn.toDescriptor(self.output)
+	find:prepare(self, input_slice, output_slice)
+
+        if not batch then
+            self.output = self.output:view(self.output:size(2),
+                                           self.output:size(3),
+                                           self.output:size(4))
+        end
+
+   end
+   return self
+end
+
+local function makeContiguous(self, input, gradOutput)
+   if not input:isContiguous() then
+      self._input = self._input or input.new()
+      self._input:typeAs(input):resizeAs(input):copy(input)
+      input = self._input
+   end
+   if gradOutput and not gradOutput:isContiguous() then
+      self._gradOutput = self._gradOutput or gradOutput.new()
+      self._gradOutput:typeAs(gradOutput):resizeAs(gradOutput):copy(gradOutput)
+      gradOutput = self._gradOutput
+   end
+   return input, gradOutput
+end
+
+function SpatialConvolution_conditioning:updateOutput(input)
+    input = makeContiguous(self, input)
+    local nBatch = input:size(1)
+    local nDim=input:size(2)
+    local iH=input:size(3)
+    local iW=input:size(4)
+
+    self.input_temp= self.input_temp or input.new() 
+    self.input_temp=input:view(nBatch,nDim,iH*iW):transpose(1,2):reshape(nDim,nBatch*iH*iW):t()
+    if self.train and self.debug and (self.count % self.interval)==0 then
+    -------------------------------for the input--------------
+      self.correlate:resize(nDim,nDim)
+      self.correlate:addmm(0,self.correlate, 1/self.input_temp:size(1),self.input_temp:t(), self.input_temp)
+      local _,buffer,_=torch.svd(self.correlate:clone():float()) --SVD Decompositon for singular value
+      --print(buffer) 
+       table.insert(self.eig_input,buffer:clone())
+       buffer:add(self.epcilo)
+       local maxEig=torch.max(buffer)
+       local conditionNumber=torch.abs(maxEig/torch.min(buffer))
+       local norm=torch.abs(self.input_temp):mean()
+       print('Input Cond='..conditionNumber..'----maxEig:'..maxEig..'---Norm:'..norm)
+       self.conditionNumber_input[#self.conditionNumber_input + 1]=conditionNumber
+       self.maxEig_input[#self.maxEig_input + 1]=maxEig
+    end 
+  
+  
+    self:createIODescriptors(input)
+    local finder = find.get()
+    local fwdAlgo = finder:forwardAlgorithm(self, { self.iDesc[0], self.input_slice, self.weightDesc[0],
+                                                    self.weight, self.convDesc[0], self.oDesc[0], self.output_slice})
+
+    local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
+    checkedCall(self,'cudnnConvolutionForward', cudnn.getHandle(),
+                    cudnn.scalar(input, 1),
+                    self.iDesc[0], input:data(),
+                    self.weightDesc[0], self.weight:data(),
+                    self.convDesc[0], fwdAlgo,
+                    extraBuffer, extraBufferSize,
+                    cudnn.scalar(input, 0),
+                    self.oDesc[0], self.output:data());
+        -- add bias
+    if self.bias then
+        errcheck('cudnnAddTensor', cudnn.getHandle(),
+                 cudnn.scalar(input, 1), self.biasDesc[0], self.bias:data(),
+                 cudnn.scalar(input, 1), self.oDescForBias[0], self.output:data())
+    end
+    collectgarbage()
+    return self.output
+end
+
+function SpatialConvolution_conditioning:updateGradInput(input, gradOutput)
+    if not self.gradInput then return end
+    self.gradInput:resizeAs(input)
+    assert(gradOutput:dim() == input:dim()-1 or gradOutput:dim() == input:dim()
+              or (gradOutput:dim()==5 and input:dim()==4), 'Wrong gradOutput dimensions');
+    input, gradOutput = makeContiguous(self, input, gradOutput)
+  
+  
+    local nBatch = gradOutput:size(1)
+    local nDim=gradOutput:size(2)
+    local iH=gradOutput:size(3)
+    local iW=gradOutput:size(4)
+    self.input_temp=gradOutput:view(nBatch,nDim,iH*iW):transpose(1,2):reshape(nDim,nBatch*iH*iW):t()
+    self.correlate:resize(nDim,nDim)
+    if self.train and self.debug and (self.count % self.interval) ==0 then
+    -------------------------------for the input--------------
+      self.correlate:addmm(0,self.correlate, self.input_temp:size(1),self.input_temp:t(), self.input_temp)
+      local _,buffer,_=torch.svd(self.correlate:clone():float()) --SVD Decompositon for singular value
+      --print(buffer) 
+       table.insert(self.eig_gradOutput,buffer:clone())
+       buffer:add(self.epcilo)
+       local maxEig=torch.max(buffer)
+       local conditionNumber=torch.abs(maxEig/torch.min(buffer))
+       local norm=torch.abs(self.input_temp):mean()*self.input_temp:size(1)
+       print('gradOutput Cond='..conditionNumber..'----maxEig:'..maxEig..'---Norm:'..norm)
+       self.conditionNumber_gradOutput[#self.conditionNumber_gradOutput + 1]=conditionNumber
+       self.maxEig_gradOutput[#self.maxEig_gradOutput + 1]=maxEig
+    end 
+
+
+  
+  
+    self.count=self.count+1 
+  
+  
+  
+    self:createIODescriptors(input)
+    local finder = find.get()
+    local bwdDataAlgo = finder:backwardDataAlgorithm(self, { self.weightDesc[0], self.weight, self.oDesc[0],
+                                                             self.output_slice, self.convDesc[0], self.iDesc[0], self.input_slice })
+    local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
+    checkedCall(self,'cudnnConvolutionBackwardData', cudnn.getHandle(),
+                    cudnn.scalar(input, 1),
+                    self.weightDesc[0], self.weight:data(),
+                    self.oDesc[0], gradOutput:data(),
+                    self.convDesc[0],
+                    bwdDataAlgo,
+                    extraBuffer, extraBufferSize,
+                    cudnn.scalar(input, 0),
+                    self.iDesc[0], self.gradInput:data())
+    return self.gradInput
+end
+
+function SpatialConvolution_conditioning:accGradParameters(input, gradOutput, scale)
+    self.scaleT = self.scaleT or self.weight.new(1)
+    -- this line forces this member to always be on CPU (needed for cudnn)
+    self.scaleT = torch.type(self.weight) == 'torch.CudaDoubleTensor'
+       and self.scaleT:double() or self.scaleT:float()
+    scale = scale or 1.0
+    self.scaleT[1] = scale
+    input, gradOutput = makeContiguous(self, input, gradOutput)
+    self:createIODescriptors(input)
+    local finder = find.get()
+    local bwdFilterAlgo = finder:backwardFilterAlgorithm(self, { self.iDesc[0], self.input_slice, self.oDesc[0],
+                                                               self.output_slice, self.convDesc[0], self.weightDesc[0], self.weight})
+
+    -- gradBias
+    if self.bias then
+        errcheck('cudnnConvolutionBackwardBias', cudnn.getHandle(),
+                 self.scaleT:data(),
+                 self.oDescForBias[0], gradOutput:data(),
+                 cudnn.scalar(input, 1),
+                 self.biasDesc[0], self.gradBias:data())
+    end
+
+    local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
+    -- gradWeight
+    checkedCall(self,'cudnnConvolutionBackwardFilter', cudnn.getHandle(),
+                   self.scaleT:data(),
+                   self.iDesc[0], input:data(),
+                   self.oDesc[0], gradOutput:data(),
+                   self.convDesc[0],
+                   bwdFilterAlgo,
+                   extraBuffer, extraBufferSize,
+                   cudnn.scalar(input, 1),
+                   self.weightDesc[0], self.gradWeight:data());
+
+    return self.gradOutput
+end
+
+function SpatialConvolution_conditioning:clearDesc()
+    self.weightDesc = nil
+    self.biasDesc = nil
+    self.convDesc = nil
+    self.iDesc = nil
+    self.oDesc = nil
+    self.oDescForBias = nil
+    self.oSize = nil
+    self.scaleT = nil
+    return self
+end
+
+
+function SpatialConvolution_conditioning:updateDebug(flag_debug)
+   self.debug=flag_debug
+end
+
+
+function SpatialConvolution_conditioning:write(f)
+    self:clearDesc()
+    local var = {}
+    for k,v in pairs(self) do
+        var[k] = v
+    end
+    f:writeObject(var)
+end
+
+function SpatialConvolution_conditioning:clearState()
+   self:clearDesc()
+   nn.utils.clear(self, '_input', '_gradOutput', 'input_slice', 'output_slice')
+   return nn.Module.clearState(self)
+end
