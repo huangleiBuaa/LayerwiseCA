@@ -1,4 +1,4 @@
-This code is for the paper: Exploring Learning Dynamics of DNNs via Layerwise Conditioning  Analysis.
+This code is for the paper: Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs.
 
 This implementation is based on Torch. The experiments in the paper are run on cuda9.0 and cudnn 7.0.
 
