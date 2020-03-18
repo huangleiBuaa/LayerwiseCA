@@ -2,10 +2,9 @@ This code is for the following paper:
 
 **Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs**
 
-Lei Huang, Dawei Yang, Bo Lang, Jia Deng
+Lei Huang, Dawei Yang, Bo Lang, Jia Deng.  [arXiv:2002.10801](https://arxiv.org/abs/2002.10801)
 
-[arXiv:2002.10801](https://arxiv.org/abs/2002.10801)
-
+===============================================================================================================
 This implementation is based on Torch. The experiments in the paper are run on cuda9.0 and cudnn 7.0.
 
 (1) We wrap the implementation of the conditioning analysis in the linear layer (./Cifar/module/Linear_AllMode.lua) and convolution layer (./Cifar/module/SpatialConvolution_conditioning.lua)
