@@ -1,6 +1,6 @@
 This code is for the following paper: 
 
-**Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs.
+**Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs**
 
 Lei Huang, Dawei Yang, Bo Lang, Jia Deng
 
