@@ -1,5 +1,10 @@
-This code is for the paper: Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs.
+This code is for the following paper: 
 
+**Layer-wise Conditioning  Analysis in Exploring the Learning Dynamics of DNNs.
+
+Lei Huang, Dawei Yang, Bo Lang, Jia Deng
+
+[arXiv:2002.10801](https://arxiv.org/abs/2002.10801)
 
 This implementation is based on Torch. The experiments in the paper are run on cuda9.0 and cudnn 7.0.
 
